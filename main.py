@@ -11,14 +11,14 @@ GET  /health          - health check
 
 import os
 import threading
-import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from opensearchpy import OpenSearch, helpers
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
@@ -34,6 +34,18 @@ OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", 9200))
 INDEX_NAME = "books"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 VECTOR_DIM = 384
+INDEX_API_KEY = os.getenv("INDEX_API_KEY", "")
+ROOT_PATH = os.getenv("ROOT_PATH", "")
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
+CORS_ALLOWED_HEADERS = [
+    header.strip()
+    for header in os.getenv("CORS_ALLOWED_HEADERS", "Authorization,Content-Type,Accept,X-Index-Api-Key").split(",")
+    if header.strip()
+]
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
@@ -70,7 +82,17 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="FondasiKehidupan Search Service", lifespan=lifespan)
+app = FastAPI(
+    title="FondasiKehidupan Search Service",
+    lifespan=lifespan,
+    root_path=ROOT_PATH,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=CORS_ALLOWED_HEADERS,
+)
 
 # ---------------------------------------------------------------------------
 # Index management
@@ -90,6 +112,7 @@ INDEX_MAPPING = {
             "authors": {"type": "text", "analyzer": "standard"},
             "genres": {"type": "keyword"},
             "publisher": {"type": "text"},
+            "book_picture": {"type": "keyword"},
             "synopsis_vector": {
                 "type": "knn_vector",
                 "dimension": VECTOR_DIM,
@@ -121,11 +144,14 @@ class BookDocument(BaseModel):
     authors: list[str] = []
     genres: list[str] = []
     publisher: str = ""
+    book_picture: str = ""
+    bookPicture: str = ""
 
 
 class SearchResult(BaseModel):
-    book_id: str
+    id: str
     title: str
+    bookPicture: str
     score: float
 
 
@@ -167,6 +193,16 @@ def reciprocal_rank_fusion(
     return [(doc_id, score) for doc_id, score in ranked]
 
 
+def require_index_api_key(
+    x_index_api_key: Optional[str] = Header(default=None),
+) -> None:
+    # Empty env means disabled (dev mode).
+    if not INDEX_API_KEY:
+        return
+    if x_index_api_key != INDEX_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -197,7 +233,7 @@ def search(
                     "fuzziness": "AUTO",
                 }
             },
-            "_source": ["book_id", "title"],
+            "_source": ["book_id", "title", "book_picture"],
         },
     )
     bm25_hits = bm25_resp["hits"]["hits"]
@@ -215,32 +251,47 @@ def search(
                     }
                 }
             },
-            "_source": ["book_id", "title"],
+            "_source": ["book_id", "title", "book_picture"],
         },
     )
     knn_hits = knn_resp["hits"]["hits"]
 
     ranked = reciprocal_rank_fusion(bm25_hits, knn_hits)
 
+    hit_data: dict[str, dict] = {}
+    for hit in bm25_hits + knn_hits:
+        source = hit.get("_source", {})
+        book_id = source.get("book_id")
+        if book_id and book_id not in hit_data:
+            hit_data[book_id] = source
+
     results = []
     for book_id, score in ranked[:limit]:
         if threshold > 0 and score < threshold:
             continue
-        # Retrieve title from cached hit data
-        title = next(
-            (h["_source"].get("title", "") for h in bm25_hits + knn_hits
-             if h["_source"]["book_id"] == book_id),
-            "",
+        source = hit_data.get(book_id, {})
+        title = source.get("title", "")
+        book_picture = source.get("book_picture", "")
+        results.append(
+            SearchResult(
+                id=book_id,
+                title=title,
+                bookPicture=book_picture,
+                score=round(score, 6),
+            )
         )
-        results.append(SearchResult(book_id=book_id, title=title, score=round(score, 6)))
 
     return results
 
 
 @app.post("/index", status_code=201)
-def index_book(doc: BookDocument):
+def index_book(
+    doc: BookDocument,
+    _: None = Depends(require_index_api_key),
+):
     text = build_text(doc.title, doc.synopsis)
     vector = embed(text)
+    book_picture = doc.book_picture or doc.bookPicture or ""
 
     os_client.index(
         index=INDEX_NAME,
@@ -252,6 +303,7 @@ def index_book(doc: BookDocument):
             "authors": doc.authors,
             "genres": doc.genres,
             "publisher": doc.publisher,
+            "book_picture": book_picture,
             "synopsis_vector": vector,
         },
         refresh="wait_for",
@@ -260,7 +312,9 @@ def index_book(doc: BookDocument):
 
 
 @app.post("/index/bulk")
-def bulk_index():
+def bulk_index(
+    _: None = Depends(require_index_api_key),
+):
     """Read all books from PostgreSQL and index them in OpenSearch."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -304,6 +358,7 @@ def bulk_index():
                     "authors": [a for a in (row["authors"] or []) if a],
                     "genres": [g for g in (row["genres"] or []) if g],
                     "publisher": row["publisher"] or "",
+                    "book_picture": row["book_picture"] or "",
                     "synopsis_vector": vector,
                 },
             }

@@ -40,6 +40,7 @@ RABBITMQ_CONFIG = dict(
 
 def _make_callback(os_client, model):
     def callback(ch, method, properties, body):
+        should_ack = False
         try:
             data = json.loads(body)
             book_id = data.get("id") or data.get("bookId")
@@ -48,7 +49,8 @@ def _make_callback(os_client, model):
             cover = data.get("bookPicture", "")
 
             if not book_id or not title:
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                # Invalid payload; drop to avoid poison-message loop.
+                should_ack = True
                 return
 
             text = f"{title}. {synopsis}"
@@ -64,14 +66,20 @@ def _make_callback(os_client, model):
                     "authors": [],
                     "genres": [],
                     "publisher": "",
+                    "book_picture": cover,
                     "synopsis_vector": vector,
                 },
             )
             log.info("Indexed book %s ('%s')", book_id, title)
+            should_ack = True
         except Exception as exc:
             log.error("Failed to index book: %s", exc)
         finally:
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+            if should_ack:
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+            else:
+                # Retry transient failures (OpenSearch/network spikes).
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     return callback
 
