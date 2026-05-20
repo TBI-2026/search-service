@@ -21,7 +21,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from opensearchpy import OpenSearch, helpers
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+
+from embedding import ONNXEmbedder, build_embedder_from_env
 
 load_dotenv()
 
@@ -32,10 +33,10 @@ load_dotenv()
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "opensearch-node")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", 9200))
 INDEX_NAME = "books"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 VECTOR_DIM = 384
 INDEX_API_KEY = os.getenv("INDEX_API_KEY", "")
 ROOT_PATH = os.getenv("ROOT_PATH", "")
+ENABLE_CONSUMER = os.getenv("ENABLE_CONSUMER", "true").lower() in {"1", "true", "yes", "on"}
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
@@ -60,7 +61,7 @@ DB_CONFIG = {
 # ---------------------------------------------------------------------------
 
 os_client: OpenSearch = None
-model: SentenceTransformer = None
+model: ONNXEmbedder = None
 
 
 @asynccontextmanager
@@ -72,12 +73,13 @@ async def lifespan(app: FastAPI):
         http_compress=True,
         use_ssl=False,
     )
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    model = build_embedder_from_env()
     ensure_index()
 
-    import consumer as _consumer
-    t = threading.Thread(target=_consumer.start, args=(os_client, model), daemon=True)
-    t.start()
+    if ENABLE_CONSUMER:
+        import consumer as _consumer
+        t = threading.Thread(target=_consumer.start, args=(os_client, model), daemon=True)
+        t.start()
 
     yield
 
@@ -164,7 +166,7 @@ def build_text(title: str, synopsis: str) -> str:
 
 
 def embed(text: str) -> list[float]:
-    return model.encode(text, normalize_embeddings=True).tolist()
+    return model.embed_document(text)
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +220,7 @@ def search(
     limit: int = Query(5, ge=1, le=50),
     threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum RRF score filter (0 = no filter)"),
 ):
-    query_vector = embed(q)
+    query_vector = model.embed_query(q)
     fetch_k = max(limit * 4, 20)  # fetch more for RRF then trim
 
     # --- BM25 query ---
@@ -363,5 +365,22 @@ def bulk_index(
                 },
             }
 
-    success, failed = helpers.bulk(os_client, generate_actions(), raise_on_error=False)
-    return {"indexed": success, "failed": failed}
+    indexed = 0
+    failed = 0
+    try:
+        for ok, _ in helpers.streaming_bulk(
+            os_client,
+            generate_actions(),
+            raise_on_error=False,
+            raise_on_exception=False,
+            chunk_size=100,
+            max_chunk_bytes=5 * 1024 * 1024,
+        ):
+            if ok:
+                indexed += 1
+            else:
+                failed += 1
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bulk indexing error: {e}")
+
+    return {"indexed": indexed, "failed": failed}

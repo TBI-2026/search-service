@@ -54,7 +54,7 @@ def _make_callback(os_client, model):
                 return
 
             text = f"{title}. {synopsis}"
-            vector = model.encode(text, normalize_embeddings=True).tolist()
+            vector = model.embed_document(text)
 
             os_client.index(
                 index=INDEX_NAME,
