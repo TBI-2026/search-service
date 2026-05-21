@@ -1,18 +1,45 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis-search
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    networks:
+      - internal-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
   search-service:
     build: .
     container_name: search-service
     env_file: .env
+    environment:
+      ENABLE_CONSUMER: "false"
     ports:
       - "8001:8001"
     networks:
       - internal-network
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
+
+  search-consumer:
+    build: .
+    container_name: search-consumer
+    command: python consumer_entrypoint.py
+    env_file: .env
+    networks:
+      - internal-network
+    restart: unless-stopped
 
 networks:
   internal-network:

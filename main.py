@@ -9,8 +9,10 @@ POST /index/bulk      - bulk-index all books from PostgreSQL
 GET  /health          - health check
 """
 
+import asyncio
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -20,8 +22,11 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from opensearchpy import OpenSearch, helpers
+from opensearchpy import AsyncOpenSearch
 from pydantic import BaseModel
 
+import cache
+import reranker as _reranker_module
 from embedding import ONNXEmbedder, build_embedder_from_env
 
 load_dotenv()
@@ -56,22 +61,35 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "postgres"),
 }
 
+# Thread pool for ONNX inference — keeps the async event loop unblocked.
+_embed_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="onnx")
+
 # ---------------------------------------------------------------------------
 # Shared singletons (initialised at startup)
 # ---------------------------------------------------------------------------
 
 os_client: OpenSearch = None
+async_os_client: AsyncOpenSearch = None
 model: ONNXEmbedder = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global os_client, model
+    global os_client, async_os_client, model
 
     os_client = OpenSearch(
         hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
         http_compress=True,
         use_ssl=False,
+    )
+    async_os_client = AsyncOpenSearch(
+        hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+        http_compress=True,
+        use_ssl=False,
+        timeout=5,
+        max_retries=2,
+        retry_on_timeout=True,
+        connections_per_node=10,
     )
     model = build_embedder_from_env()
     ensure_index()
@@ -82,6 +100,8 @@ async def lifespan(app: FastAPI):
         t.start()
 
     yield
+
+    await async_os_client.close()
 
 
 app = FastAPI(
@@ -104,7 +124,8 @@ INDEX_MAPPING = {
     "settings": {
         "index.knn": True,
         "number_of_shards": 1,
-        "number_of_replicas": 0,
+        "number_of_replicas": int(os.getenv("OPENSEARCH_REPLICAS", "0")),
+        "refresh_interval": os.getenv("OPENSEARCH_REFRESH_INTERVAL", "1s"),
     },
     "mappings": {
         "properties": {
@@ -158,7 +179,7 @@ class SearchResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Embedding helper
+# Embedding helpers
 # ---------------------------------------------------------------------------
 
 def build_text(title: str, synopsis: str) -> str:
@@ -167,6 +188,11 @@ def build_text(title: str, synopsis: str) -> str:
 
 def embed(text: str) -> list[float]:
     return model.embed_document(text)
+
+
+async def embed_query_async(text: str) -> list[float]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_embed_executor, model.embed_query, text)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +224,6 @@ def reciprocal_rank_fusion(
 def require_index_api_key(
     x_index_api_key: Optional[str] = Header(default=None),
 ) -> None:
-    # Empty env means disabled (dev mode).
     if not INDEX_API_KEY:
         return
     if x_index_api_key != INDEX_API_KEY:
@@ -215,16 +240,30 @@ def health():
 
 
 @app.get("/search", response_model=list[SearchResult])
-def search(
+async def search(
     q: str = Query(..., description="Natural language search query"),
     limit: int = Query(5, ge=1, le=50),
     threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum RRF score filter (0 = no filter)"),
 ):
-    query_vector = model.embed_query(q)
-    fetch_k = max(limit * 4, 20)  # fetch more for RRF then trim
+    # 1. Full-results cache — fastest path (~5ms on hit)
+    cached = cache.get_results(q, limit, threshold)
+    if cached is not None:
+        return cached
 
-    # --- BM25 query ---
-    bm25_resp = os_client.search(
+    # 2. Embedding cache — skip ONNX if this query was seen before
+    query_vector = cache.get_embedding(q)
+    if query_vector is None:
+        query_vector = await embed_query_async(q)
+        cache.set_embedding(q, query_vector)
+
+    fetch_k = max(limit * 4, 20)
+
+    # 3. BM25 + kNN in parallel
+    source_fields = ["book_id", "title", "book_picture"]
+    if _reranker_module.ENABLE_RERANKER:
+        source_fields.append("synopsis")
+
+    bm25_task = async_os_client.search(
         index=INDEX_NAME,
         body={
             "size": fetch_k,
@@ -235,13 +274,10 @@ def search(
                     "fuzziness": "AUTO",
                 }
             },
-            "_source": ["book_id", "title", "book_picture"],
+            "_source": source_fields,
         },
     )
-    bm25_hits = bm25_resp["hits"]["hits"]
-
-    # --- kNN query ---
-    knn_resp = os_client.search(
+    knn_task = async_os_client.search(
         index=INDEX_NAME,
         body={
             "size": fetch_k,
@@ -253,9 +289,12 @@ def search(
                     }
                 }
             },
-            "_source": ["book_id", "title", "book_picture"],
+            "_source": source_fields,
         },
     )
+    bm25_resp, knn_resp = await asyncio.gather(bm25_task, knn_task)
+
+    bm25_hits = bm25_resp["hits"]["hits"]
     knn_hits = knn_resp["hits"]["hits"]
 
     ranked = reciprocal_rank_fusion(bm25_hits, knn_hits)
@@ -267,21 +306,34 @@ def search(
         if book_id and book_id not in hit_data:
             hit_data[book_id] = source
 
+    # 4. Optional cross-encoder reranking of top candidates
+    if _reranker_module.ENABLE_RERANKER:
+        candidates = [(book_id, score, hit_data.get(book_id, {})) for book_id, score in ranked]
+        loop = asyncio.get_running_loop()
+        reranked = await loop.run_in_executor(
+            _embed_executor,
+            lambda: _reranker_module.rerank(q, candidates),
+        )
+        ranked = [(book_id, score) for book_id, score, _ in reranked]
+
+    # 5. Assemble final results
     results = []
     for book_id, score in ranked[:limit]:
         if threshold > 0 and score < threshold:
             continue
         source = hit_data.get(book_id, {})
-        title = source.get("title", "")
-        book_picture = source.get("book_picture", "")
         results.append(
             SearchResult(
                 id=book_id,
-                title=title,
-                bookPicture=book_picture,
+                title=source.get("title", ""),
+                bookPicture=source.get("book_picture", ""),
                 score=round(score, 6),
             )
         )
+
+    # 6. Cache results for next requests
+    results_dicts = [r.model_dump() for r in results]
+    cache.set_results(q, limit, threshold, results_dicts)
 
     return results
 
@@ -346,10 +398,12 @@ def bulk_index(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
+    # Batch-embed all books in a single ONNX call (replaces sequential per-book embedding)
+    texts = [build_text(row["title"], row["synopsis"]) for row in rows]
+    vectors = model.embed_documents_batch(texts)
+
     def generate_actions():
-        for row in rows:
-            text = build_text(row["title"], row["synopsis"])
-            vector = embed(text)
+        for row, vector in zip(rows, vectors):
             yield {
                 "_index": INDEX_NAME,
                 "_id": str(row["book_id"]),
