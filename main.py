@@ -398,26 +398,28 @@ def bulk_index(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    # Batch-embed all books in a single ONNX call (replaces sequential per-book embedding)
-    texts = [build_text(row["title"], row["synopsis"]) for row in rows]
-    vectors = model.embed_documents_batch(texts)
+    EMBED_BATCH = int(os.getenv("EMBED_BATCH_SIZE", "100"))
 
     def generate_actions():
-        for row, vector in zip(rows, vectors):
-            yield {
-                "_index": INDEX_NAME,
-                "_id": str(row["book_id"]),
-                "_source": {
-                    "book_id": str(row["book_id"]),
-                    "title": row["title"],
-                    "synopsis": row["synopsis"],
-                    "authors": [a for a in (row["authors"] or []) if a],
-                    "genres": [g for g in (row["genres"] or []) if g],
-                    "publisher": row["publisher"] or "",
-                    "book_picture": row["book_picture"] or "",
-                    "synopsis_vector": vector,
-                },
-            }
+        for batch_start in range(0, len(rows), EMBED_BATCH):
+            batch = rows[batch_start: batch_start + EMBED_BATCH]
+            texts = [build_text(row["title"], row["synopsis"]) for row in batch]
+            vectors = model.embed_documents_batch(texts)
+            for row, vector in zip(batch, vectors):
+                yield {
+                    "_index": INDEX_NAME,
+                    "_id": str(row["book_id"]),
+                    "_source": {
+                        "book_id": str(row["book_id"]),
+                        "title": row["title"],
+                        "synopsis": row["synopsis"],
+                        "authors": [a for a in (row["authors"] or []) if a],
+                        "genres": [g for g in (row["genres"] or []) if g],
+                        "publisher": row["publisher"] or "",
+                        "book_picture": row["book_picture"] or "",
+                        "synopsis_vector": vector,
+                    },
+                }
 
     indexed = 0
     failed = 0
